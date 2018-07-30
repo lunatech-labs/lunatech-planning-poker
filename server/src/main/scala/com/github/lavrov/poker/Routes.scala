@@ -3,9 +3,9 @@ package com.github.lavrov.poker
 import akka.http.scaladsl.server.directives.MethodDirectives.post
 import akka.http.scaladsl.server.directives.RouteDirectives.complete
 import akka.http.scaladsl.server.directives.PathDirectives.path
-
 import akka.actor.{ActorRef, ActorSystem}
 import akka.event.Logging
+import akka.http.scaladsl.marshalling.ToResponseMarshallable
 import akka.http.scaladsl.model.{HttpResponse, StatusCodes}
 
 import scala.concurrent.duration._
@@ -13,13 +13,15 @@ import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.model.headers._
 import akka.http.scaladsl.model.ws.{Message, TextMessage}
 import akka.http.scaladsl.server.Route
-import io.circe.syntax._
-import io.circe.generic.auto._
-import io.circe.parser._
 import akka.stream.{ActorMaterializer, OverflowStrategy}
 import akka.stream.scaladsl.{Flow, Sink, Source}
 import akka.util.Timeout
 import akka.pattern.ask
+import cats.data.OptionT
+import cats.instances.future._
+import com.github.lavrov.poker.Protocol.ClientMessage
+import com.github.lavrov.poker.Formats._
+import io.circe.syntax._, io.circe.parser._
 
 class Routes(
     sessionManager: ActorRef
@@ -43,6 +45,23 @@ class Routes(
             (sessionManager ? SessionManager.Create()).mapTo[String]
           )
         } ~
+        path(Segment) { sessionId =>
+          get {
+            complete {
+              val maybeSession =
+                for {
+                  sessionActorRef <- OptionT((sessionManager ? SessionManager.Get(sessionId)).mapTo[Option[ActorRef]])
+                  session <- OptionT liftF (sessionActorRef ? SessionActor.Get).mapTo[PlanningSession]
+                }
+                yield
+                  session
+              maybeSession.cata[ToResponseMarshallable](
+                HttpResponse(StatusCodes.NotFound),
+                implicitly
+              )
+            }
+          }
+        } ~
         path(Segment / "ws" / Segment) { case (sessionId, userId) =>
           extractUpgradeToWebSocket { upgrade =>
             val response =
@@ -50,27 +69,42 @@ class Routes(
                 .mapTo[Option[ActorRef]]
                 .map {
                   case Some(sessionActorRef) =>
-                    val (ref: ActorRef, source: Source[TextMessage.Strict, _]) =
+                    val (ref: ActorRef, sessionActorSource: Source[TextMessage.Strict, _]) =
                       Source
                         .actorRef[PlanningSession](100, OverflowStrategy.dropNew)
+                        .map(ps => Protocol.ServerMessage.SessionUpdated(ps): Protocol.ServerMessage)
                         .map(m => TextMessage.Strict(m.asJson.noSpaces))
                         .preMaterialize()
+
                     sessionActorRef ! SessionActor.Subscribe(userId, ref)
-                    val sink = Sink
-                      .actorRef[SessionActor.SessionAction](sessionActorRef, ())
-                      .contramap[Message] {
-                        case TextMessage.Strict(tm) =>
-                          decode[PlanningSession.Action](tm) match {
-                            case Right(action) =>
-                              SessionActor.SessionAction(action)
-                            case Left(error) =>
-                              log.error(error, error.getMessage)
-                              throw error
-                          }
-                        case _ =>
-                          throw new Exception("Unsupported input message")
+
+                    val clientMessages: Flow[Message, ClientMessage, _] = Flow.fromFunction {
+                      case TextMessage.Strict(tm) =>
+                        decode[Protocol.ClientMessage](tm) match {
+                          case Right(clientMessage) =>
+                            clientMessage
+                          case Left(error) =>
+                            log.error(error, error.getMessage)
+                            throw error
+                        }
+                      case _ =>
+                        throw new Exception("Message not supported")
+                    }
+
+                    val handleClientFlow: Flow[Message, Message, _] = clientMessages.flatMapMerge(
+                      breadth = 1,
+                      f = {
+                        case Protocol.ClientMessage.Ping =>
+                          val pong: Protocol.ServerMessage = Protocol.ServerMessage.Pong
+                          Source.single(TextMessage.Strict(pong.asJson.noSpaces))
+                        case Protocol.ClientMessage.SessionAction(action) =>
+                          sessionActorRef ! SessionActor.SessionAction(action)
+                          Source.empty
                       }
-                    upgrade.handleMessages(Flow.fromSinkAndSource(sink, source))
+                    )
+
+                    val handleFlow = handleClientFlow.merge(sessionActorSource)
+                    upgrade.handleMessages(handleFlow)
                   case None =>
                     HttpResponse(StatusCodes.NotFound)
                 }
